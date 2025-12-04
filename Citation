@@ -1,0 +1,20 @@
+
+---
+
+# ✅ **2. `requirements.txt`**
+
+```txt
+numpy
+scipy
+pandas
+sklearn
+matplotlib
+seaborn
+torch
+torchvision
+torchaudio
+pytorch-lightning
+cvxpy
+jsonschema
+shap
+tqdm
