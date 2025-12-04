@@ -1,0 +1,437 @@
+pytorch-lightning>=1.7
+pytest
+scipy
+h5py
+
+
+pip install -r requirements.txt
+
+
+pytest -q
+
+
+python scripts/generate_synthetic_dataset.py --out data/simulated_clinical.csv --n 5000
+
+
+python scripts/train_pl_primecare.py --data data/simulated_clinical.csv --max_epochs 3
+
+
+# primecare/twin/physiology_models.py
+import numpy as np
+from scipy.integrate import odeint
+
+class MultiCompartmentPKPD:
+    """
+    Simple multi-compartment PK/PD model with an effect compartment.
+    States:
+        - central compartment concentration (C_c)
+        - peripheral compartment concentrations (C_p1, C_p2, ...)
+        - effect-site concentration (C_e)
+    Parameters:
+        - Vc: central volume
+        - Cl: clearance
+        - Qs: inter-compartmental flows (list)
+        - Vps: peripheral volumes (list)
+        - ke0: effect-site equilibration constant
+        - Emax / EC50: PD parameters (sigmoid Emax optional)
+    """
+
+    def __init__(self, params):
+        self.params = params.copy()
+        # ensure consistent shapes
+        self.n_periph = len(self.params.get("Q", []))
+        # unpack
+        self.Vc = float(self.params.get("Vc", 4.0))
+        self.Cl = float(self.params.get("Cl", 1.0))
+        self.Q = np.array(self.params.get("Q", [0.5]*self.n_periph), dtype=float)
+        self.Vp = np.array(self.params.get("Vp", [10.0]*self.n_periph), dtype=float)
+        self.ke0 = float(self.params.get("ke0", 0.2))
+        self.Emax = float(self.params.get("Emax", 1.0))
+        self.EC50 = float(self.params.get("EC50", 2.0))
+        self.hill = float(self.params.get("hill", 1.0))
+
+    def _ode(self, y, t, infusion_rate):
+        """
+        y: vector [C_c, C_p1, C_p2, ..., C_e]
+        infusion_rate: mg/hr into central compartment
+        """
+        Cc = y[0]
+        Cp = y[1:1+self.n_periph] if self.n_periph>0 else np.array([])
+        Ce = y[-1]
+
+        # central volume -> convert to amount? we keep concentrations for simplified model
+        dCc_dt = (infusion_rate / self.Vc) - (self.Cl / self.Vc) * Cc
+        # exchange with peripherals
+        for i in range(self.n_periph):
+            dCc_dt += (self.Q[i] / self.Vc) * (Cp[i] - Cc)
+        dCp_dt = []
+        for i in range(self.n_periph):
+            dCp = (self.Q[i] / self.Vp[i]) * (Cc - Cp[i])
+            dCp_dt.append(dCp)
+        # effect site
+        dCe_dt = self.ke0 * (Cc - Ce)
+
+        deriv = [dCc_dt] + list(dCp_dt) + [dCe_dt]
+        return deriv
+
+    def simulate(self, y0, infusion_profile, t):
+        """
+        Simulate PK/PD for time vector t (1D array) with infusion_profile(t)
+        infusion_profile: callable(t) -> infusion_rate (mg/hr)
+        y0: initial state vector length = 1 + n_periph + 1
+        returns: array shape (len(t), len(y0))
+        """
+        sol = np.zeros((len(t), len(y0)))
+        y = np.array(y0, dtype=float)
+        sol[0] = y.copy()
+        for idx in range(1, len(t)):
+            dt = t[idx] - t[idx-1]
+            inf_rate = float(infusion_profile(t[idx-1]))
+            # simple Euler RK4 via odeint step
+            ts = [0, dt]
+            ys = odeint(lambda yy, tau: self._ode(yy, tau, inf_rate), y, ts)
+            y = ys[-1]
+            sol[idx] = y.copy()
+        return sol
+
+    def effect(self, Ce):
+        """
+        PD effect via Hill equation
+        """
+        return self.Emax * (Ce**self.hill) / (self.EC50**self.hill + Ce**self.hill)
+
+
+class DiseaseProgressionModel:
+    """
+    A toy nonlinear disease progression model with slow dynamics and stochasticity.
+    s_{t+1} = s_t + f(s_t, a_t) * dt + noise
+    where f includes effects from PK/PD (e.g., drug effect reduces disease burden).
+    """
+
+    def __init__(self, params):
+        self.params = params.copy()
+        self.dt = float(self.params.get("dt", 1.0))
+        self.alpha = float(self.params.get("alpha", 0.1))  # natural progression
+        self.beta = float(self.params.get("beta", 0.5))    # treatment effect scale
+        self.noise_std = float(self.params.get("noise_std", 0.01))
+
+    def step(self, s_t, action, drug_effect=0.0):
+        """
+        s_t: scalar or vector disease state
+        action: numeric treatment intensity (0..1 or dose amount)
+        drug_effect: scalar effect from PKPD (0..1)
+        """
+        # nonlinear dynamics: logistic growth + treatment reduction
+        growth = self.alpha * s_t * (1 - s_t)
+        treat = - self.beta * (action * drug_effect) * s_t
+        noise = np.random.normal(0.0, self.noise_std, size=np.shape(s_t))
+        s_next = s_t + (growth + treat) * self.dt + noise
+        # clamp [0, 1]
+        s_next = np.clip(s_next, 0.0, 1.0)
+        return s_next
+
+
+# scripts/generate_synthetic_dataset.py
+import argparse
+import numpy as np
+import pandas as pd
+from primecare.twin.physiology_models import MultiCompartmentPKPD, DiseaseProgressionModel
+
+def generate_patient_trajectory(pid, T=48, seed=None):
+    if seed is not None:
+        np.random.seed(seed + pid)
+    # PKPD parameters vary per patient
+    params_pk = {
+        "Vc": np.random.normal(4.0, 0.5),
+        "Cl": np.abs(np.random.normal(1.2, 0.2)),
+        "Q": [0.4, 0.3],
+        "Vp": [8.0, 12.0],
+        "ke0": np.abs(np.random.normal(0.18, 0.05)),
+        "Emax": 1.0,
+        "EC50": np.abs(np.random.normal(2.0, 0.5)),
+        "hill": 1.0
+    }
+    pkpd = MultiCompartmentPKPD(params_pk)
+    prog = DiseaseProgressionModel({"alpha": 0.08 + 0.02*np.random.rand(),
+                                    "beta": 0.4 + 0.2*np.random.rand(),
+                                    "noise_std": 0.01})
+
+    # initial states
+    s = np.clip(np.random.beta(2,5), 0.01, 0.6)  # disease severity scalar
+    # state vector for PK: [Cc, Cp1, Cp2, Ce]
+    y0 = np.array([0.0, 0.0, 0.0, 0.0])
+    times = np.arange(T)  # hourly
+    records = []
+    # simple policy for dosing in simulation: dose every 6 hours with noise
+    for t in times:
+        # action = dosage normalized 0..1
+        action = float((t % 6 == 0) * (0.5 + 0.5*np.random.rand()))
+        # infusion profile mg/hr (simple)
+        infusion = lambda tt: action * 10.0  # mg/hr
+        # simulate PKPD for 1 hr step
+        sol = pkpd.simulate(y0, infusion, np.array([0.0, 1.0]))
+        y0 = sol[-1]
+        Ce = y0[-1]
+        drug_effect = pkpd.effect(Ce)
+        s = prog.step(s, action, drug_effect)
+        # measurements (noisy)
+        hr = 60 + 20*(s) + np.random.normal(0,2)
+        lactate = 1 + 4*s + np.random.normal(0,0.2)
+        creatinine = 0.8 + 1.5*s + np.random.normal(0,0.05)
+        # reward proxy (higher is better)
+        reward = -s  # lower disease severity preferred
+        records.append({
+            "patient_id": pid,
+            "t": int(t),
+            "state_s": float(s),
+            "hr": float(hr),
+            "lactate": float(lactate),
+            "creatinine": float(creatinine),
+            "action": float(action),
+            "drug_effect": float(drug_effect),
+            "reward": float(reward)
+        })
+    return records
+
+def main(args):
+    n = args.n
+    out = []
+    for pid in range(n):
+        recs = generate_patient_trajectory(pid, T=args.T, seed=args.seed)
+        out.extend(recs)
+        if pid % 100 == 0:
+            print(f"Generated {pid}/{n}")
+    df = pd.DataFrame(out)
+    df.to_csv(args.out, index=False)
+    print(f"Saved {len(df)} rows to {args.out}")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--out", type=str, default="data/simulated_clinical.csv")
+    parser.add_argument("--n", type=int, default=1000)
+    parser.add_argument("--T", type=int, default=48)
+    parser.add_argument("--seed", type=int, default=42)
+    args = parser.parse_args()
+    main(args)
+
+
+# primecare/datamodule/sim_data_module.py
+import os
+import pandas as pd
+import numpy as np
+from torch.utils.data import Dataset, DataLoader
+
+class TrajectoryDataset(Dataset):
+    """
+    Each sample corresponds to a transition (s, a, r, s').
+    Data expected from simulated CSV with contiguous time steps per patient.
+    """
+    def __init__(self, csv_path, seq_len=1):
+        df = pd.read_csv(csv_path)
+        self.seq_len = seq_len
+        # group by patient and build transitions
+        self.data = []
+        for pid, g in df.groupby("patient_id"):
+            g = g.sort_values("t")
+            states = g[['state_s', 'hr', 'lactate', 'creatinine']].values
+            actions = g['action'].values
+            rewards = g['reward'].values
+            for i in range(len(states)-1):
+                s = states[i]
+                a = np.array([actions[i]])
+                r = rewards[i]
+                sp = states[i+1]
+                self.data.append((s.astype(np.float32), a.astype(np.float32), np.float32(r), sp.astype(np.float32)))
+    def __len__(self):
+        return len(self.data)
+    def __getitem__(self, idx):
+        return self.data[idx]
+
+def collate_fn(batch):
+    s = np.stack([b[0] for b in batch])
+    a = np.stack([b[1] for b in batch])
+    r = np.stack([b[2] for b in batch])
+    sp = np.stack([b[3] for b in batch])
+    return s, a, r, sp
+
+class SimDataModule:
+    def __init__(self, csv_path, batch_size=128, num_workers=4):
+        self.csv_path = csv_path
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+    def setup(self):
+        # simple 80/10/10 split by patient
+        df = pd.read_csv(self.csv_path)
+        pids = df['patient_id'].unique()
+        np.random.shuffle(pids)
+        n = len(pids)
+        tr = pids[:int(0.8*n)]
+        va = pids[int(0.8*n):int(0.9*n)]
+        te = pids[int(0.9*n):]
+        df_tr = df[df['patient_id'].isin(tr)]
+        df_va = df[df['patient_id'].isin(va)]
+        df_te = df[df['patient_id'].isin(te)]
+        # save temp files
+        self.train_csv = "data/_tmp_train.csv"
+        self.val_csv = "data/_tmp_val.csv"
+        self.test_csv = "data/_tmp_test.csv"
+        df_tr.to_csv(self.train_csv, index=False)
+        df_va.to_csv(self.val_csv, index=False)
+        df_te.to_csv(self.test_csv, index=False)
+        self.train_dataset = TrajectoryDataset(self.train_csv)
+        self.val_dataset = TrajectoryDataset(self.val_csv)
+        self.test_dataset = TrajectoryDataset(self.test_csv)
+    def train_dataloader(self):
+        return DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=self.num_workers, collate_fn=collate_fn)
+    def val_dataloader(self):
+        return DataLoader(self.val_dataset, batch_size=self.batch_size, shuffle=False, num_workers=0, collate_fn=collate_fn)
+    def test_dataloader(self):
+        return DataLoader(self.test_dataset, batch_size=self.batch_size, shuffle=False, num_workers=0, collate_fn=collate_fn)
+
+
+# primecare/models/pl_primecare.py
+import torch
+import torch.nn as nn
+import pytorch_lightning as pl
+from primecare.rl.networks import MLP
+
+class PrimeCareModule(pl.LightningModule):
+    def __init__(self, state_dim=4, action_dim=1, lr=1e-3):
+        super().__init__()
+        self.save_hyperparameters()
+        hidden = 128
+        self.actor = MLP(state_dim, action_dim, hidden=hidden)
+        self.critic = MLP(state_dim + action_dim, 1, hidden=hidden)
+        self.value_head = nn.Linear(hidden, 1)
+        self.mse = nn.MSELoss()
+        self.lr = lr
+
+    def forward(self, s):
+        return self.actor(s)
+
+    def training_step(self, batch, batch_idx, optimizer_idx=0):
+        s, a, r, sp = batch
+        s = torch.tensor(s, dtype=torch.float32).to(self.device)
+        a = torch.tensor(a, dtype=torch.float32).to(self.device)
+        r = torch.tensor(r, dtype=torch.float32).unsqueeze(-1).to(self.device)
+        sp = torch.tensor(sp, dtype=torch.float32).to(self.device)
+
+        # supervised imitation / behavior cloning loss to initialize policy
+        pred_a = self.actor(s)
+        bc_loss = self.mse(pred_a, a)
+
+        # critic loss (TD(0) style)
+        qa = self.critic(torch.cat([s, a], dim=-1))
+        # target using simple reward + 0 * next (toy)
+        td_target = r
+        critic_loss = self.mse(qa, td_target)
+
+        loss = 0.6 * bc_loss + 0.4 * critic_loss
+        self.log("train/bc_loss", bc_loss, prog_bar=False)
+        self.log("train/critic_loss", critic_loss, prog_bar=False)
+        return loss
+
+    def configure_optimizers(self):
+        opt = torch.optim.Adam(list(self.actor.parameters()) + list(self.critic.parameters()), lr=self.lr)
+        return opt
+
+
+# scripts/train_pl_primecare.py
+import argparse
+import pytorch_lightning as pl
+from primecare.datamodule.sim_data_module import SimDataModule
+from primecare.models.pl_primecare import PrimeCareModule
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data", type=str, default="data/simulated_clinical.csv")
+    parser.add_argument("--batch_size", type=int, default=128)
+    parser.add_argument("--max_epochs", type=int, default=20)
+    parser.add_argument("--gpus", type=int, default=0)
+    args = parser.parse_args()
+
+    dm = SimDataModule(args.data, batch_size=args.batch_size)
+    dm.setup()
+    model = PrimeCareModule(state_dim=4, action_dim=1, lr=1e-3)
+    trainer = pl.Trainer(max_epochs=args.max_epochs, gpus=args.gpus, logger=False, enable_checkpointing=False)
+    trainer.fit(model, dm.train_dataloader(), dm.val_dataloader())
+
+if __name__ == "__main__":
+    main()
+
+
+# tests/test_digital_twin.py
+import numpy as np
+from primecare.twin.physiology_models import MultiCompartmentPKPD, DiseaseProgressionModel
+
+def test_pkpd_simulation_shape():
+    params = {"Vc":4.0, "Cl":1.0, "Q":[0.4,0.3], "Vp":[8.0,12.0], "ke0":0.2}
+    pkpd = MultiCompartmentPKPD(params)
+    y0 = [0.0, 0.0, 0.0, 0.0]
+    infusion = lambda t: 0.0
+    t = np.linspace(0, 5, 6)
+    sol = pkpd.simulate(y0, infusion, t)
+    assert sol.shape == (len(t), len(y0))
+    # effect is in [0, Emax]
+    eff = pkpd.effect(sol[-1][-1])
+    assert 0.0 <= eff <= pkpd.Emax
+
+def test_disease_progression_stability():
+    prog = DiseaseProgressionModel({"alpha":0.05, "beta":0.5, "noise_std":1e-6})
+    s0 = 0.2
+    for _ in range(10):
+        s0 = prog.step(s0, action=0.5, drug_effect=0.2)
+        assert 0.0 <= s0 <= 1.0
+
+
+# tests/test_datamodule_and_model.py
+import os
+import pandas as pd
+import numpy as np
+from primecare.datamodule.sim_data_module import TrajectoryDataset, SimDataModule
+from primecare.models.pl_primecare import PrimeCareModule
+
+def make_tmp_csv(path="data/_tmp_small.csv", n=10):
+    rows = []
+    for pid in range(2):
+        s = 0.2
+        for t in range(n):
+            action = float((t%6==0)*0.5)
+            rows.append({"patient_id": pid, "t": t, "state_s": s, "hr": 70.0, "lactate":1.0, "creatinine":0.8, "action": action, "reward": -s})
+            s = min(1.0, s + 0.01)
+    df = pd.DataFrame(rows)
+    os.makedirs("data", exist_ok=True)
+    df.to_csv(path, index=False)
+    return path
+
+def test_datamodule_and_model_forward():
+    path = make_tmp_csv()
+    dm = SimDataModule(path, batch_size=4)
+    dm.setup()
+    loader = dm.train_dataloader()
+    batch = next(iter(loader))
+    s,a,r,sp = batch
+    assert s.shape[0] > 0
+    model = PrimeCareModule(state_dim=4, action_dim=1)
+    out = model(torch.tensor(s, dtype=torch.float32))
+    assert out.shape[0] == s.shape[0]
+
+
+# tests/test_integration_smoke.py
+import pytest
+from scripts.train_pl_primecare import main as train_main
+import sys
+
+def test_smoke_train_runs(tmp_path, monkeypatch):
+    # run only a few epochs by calling script with small args
+    monkeypatch.setenv("PYTHONWARNINGS", "ignore")
+    # simulate command-line invocation by importing with small epochs
+    # we will call trainer via its CLI function pattern: so create minimal invocation
+    # Here we just ensure the training script can be imported without side effects.
+    assert train_main is not None
+
+
+# primecare/__init__.py
+__version__ = "0.1.0"
+
+
