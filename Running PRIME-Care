@@ -1,0 +1,2 @@
+python scripts/train_primecare.py
+python scripts/evaluate_primecare.py
