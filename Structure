@@ -1,0 +1,60 @@
+PRIME-Care/
+│
+├── README.md
+├── requirements.txt
+├── setup.py
+│
+├── primecare/
+│   ├── __init__.py
+│   ├── config/
+│   │   ├── defaults.py
+│   │   └── clinical_constraints.json
+│   │
+│   ├── data/
+│   │   ├── dataloader.py
+│   │   ├── preprocessing.py
+│   │   └── state_representation.py
+│   │
+│   ├── twin/
+│   │   ├── digital_twin.py
+│   │   ├── physiology_models.py
+│   │   └── uncertainty.py
+│   │
+│   ├── rl/
+│   │   ├── agent.py
+│   │   ├── networks.py
+│   │   ├── offline_rl.py
+│   │   └── replay_buffer.py
+│   │
+│   ├── optimization/
+│   │   ├── safety_mpc.py
+│   │   ├── feasibility_projection.py
+│   │   └── constraints.py
+│   │
+│   ├── bilevel/
+│   │   ├── bilevel_controller.py
+│   │   └── trainer.py
+│   │
+│   ├── evaluation/
+│   │   ├── metrics.py
+│   │   ├── calibration.py
+│   │   ├── dca.py
+│   │   ├── shap_utils.py
+│   │   └── experiments.py
+│   │
+│   ├── visualization/
+│   │   ├── roc_plot.py
+│   │   ├── calibration_plot.py
+│   │   ├── dca_plot.py
+│   │   └── shap_summary_plot.py
+│   │
+│   └── utils/
+│       ├── logger.py
+│       ├── seed.py
+│       └── math_utils.py
+│
+└── scripts/
+    ├── train_primecare.py
+    ├── evaluate_primecare.py
+    ├── run_digital_twin.py
+    └── generate_figures.py
