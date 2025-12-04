@@ -1,0 +1,181 @@
+CONFIG = {
+    "state_dim": 32,
+    "action_dim": 5,
+    "discount": 0.99,
+    "device": "cuda",
+    "offline_epochs": 400,
+    "batch_size": 128,
+    "mpc_horizon": 8,
+    "safety_weight": 10.0,
+    "uncertainty_model": "gaussian"
+}
+
+import pandas as pd
+
+class ClinicalDataset:
+    def __init__(self, path):
+        self.df = pd.read_csv(path)
+
+    def get_transition_tuples(self):
+        return (
+            self.df['state'].values,
+            self.df['action'].values,
+            self.df['reward'].values,
+            self.df['next_state'].values,
+            self.df['terminal'].values
+        )
+
+  import numpy as np
+
+class DigitalTwin:
+    """
+    Personalized patient simulator approximating physiological dynamics.
+    """
+    def __init__(self, parameters):
+        self.params = parameters
+
+    def step(self, state, action):
+        A = self.params["A"]
+        B = self.params["B"]
+        noise = np.random.normal(0, self.params["noise_std"], size=state.shape)
+
+        next_state = A @ state + B @ action + noise
+        return next_state
+
+  import numpy as np
+
+class UncertaintyModel:
+    def __init__(self, mode="gaussian"):
+        self.mode = mode
+
+    def sample(self, mu, sigma):
+        if self.mode == "gaussian":
+            return np.random.normal(mu, sigma)
+        else:
+            raise NotImplementedError
+
+import cvxpy as cp
+import numpy as np
+
+class SafetyMPC:
+    """
+    Solves the safety-constrained MPC subproblem.
+    """
+
+    def __init__(self, horizon, A, B, constraints):
+        self.horizon = horizon
+        self.A = A
+        self.B = B
+        self.constraints = constraints
+
+    def solve(self, x0, policy_action):
+        x = cp.Variable((self.A.shape[0], self.horizon + 1))
+        u = cp.Variable((policy_action.shape[0], self.horizon))
+
+        cost = 0
+        constraints = [x[:, 0] == x0]
+
+        for t in range(self.horizon):
+            constraints += [
+                x[:, t+1] == self.A @ x[:, t] + self.B @ u[:, t]
+            ]
+            constraints += self.constraints.bound_constraints(u[:, t])
+            cost += cp.sum_squares(u[:, t] - policy_action)
+
+        problem = cp.Problem(cp.Minimize(cost), constraints)
+        problem.solve()
+
+        return u[:, 0].value
+
+  import torch
+import torch.nn as nn
+
+class MLP(nn.Module):
+    def __init__(self, in_dim, out_dim, hidden=256):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden), nn.ReLU(),
+            nn.Linear(hidden, hidden), nn.ReLU(),
+            nn.Linear(hidden, out_dim)
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+  import torch
+import torch.nn as nn
+import torch.optim as optim
+from .networks import MLP
+
+class RLAgent:
+    """
+    Conservative offline RL agent for PRIME-Care.
+    """
+
+    def __init__(self, state_dim, action_dim):
+        self.q = MLP(state_dim + action_dim, 1)
+        self.optimizer = optim.Adam(self.q.parameters(), lr=3e-4)
+
+    def act(self, state):
+        # Simple epsilon-greedy placeholder
+        return torch.randn(5) * 0.1
+
+  class BilevelController:
+    """
+    Combines RL agent with safety-constrained optimization.
+    """
+
+    def __init__(self, agent, mpc):
+        self.agent = agent
+        self.mpc = mpc
+
+    def select_action(self, state):
+        # RL proposes a raw action
+        rl_action = self.agent.act(state)
+
+        # Safety MPC projects action into feasible set
+        safe_action = self.mpc.solve(state, rl_action.detach().numpy())
+
+        return safe_action
+
+  from sklearn.metrics import roc_auc_score, brier_score_loss
+
+def compute_auc(y_true, y_pred):
+    return roc_auc_score(y_true, y_pred)
+
+def compute_calibration(y_true, y_prob):
+    return brier_score_loss(y_true, y_prob)
+
+  import torch
+from primecare.config.defaults import CONFIG
+from primecare.rl.agent import RLAgent
+from primecare.optimization.safety_mpc import SafetyMPC
+from primecare.bilevel.bilevel_controller import BilevelController
+
+def main():
+
+    # Initialize models
+    agent = RLAgent(CONFIG["state_dim"], CONFIG["action_dim"])
+
+    A = torch.eye(CONFIG["state_dim"]).numpy()
+    B = torch.randn(CONFIG["state_dim"], CONFIG["action_dim"]).numpy()
+
+    constraints = ...  # load JSON constraints
+
+    mpc = SafetyMPC(
+        CONFIG["mpc_horizon"],
+        A, B,
+        constraints
+    )
+
+    controller = BilevelController(agent, mpc)
+
+    # Example training loop placeholder
+    for epoch in range(CONFIG["offline_epochs"]):
+        print(f"Epoch {epoch}: training offline RL...")
+
+    print("Training complete.")
+
+if __name__ == "__main__":
+    main()
+
