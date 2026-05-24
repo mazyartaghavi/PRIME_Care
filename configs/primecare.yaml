@@ -1,0 +1,35 @@
+experiment:
+  name: primecare_default
+  seed: 42
+  output_dir: results/
+
+data:
+  path: data/simulated_clinical.csv
+  train_split: 0.70
+  val_split: 0.10
+  test_split: 0.20
+  batch_size: 64
+
+model:
+  state_dim: 4
+  action_dim: 1
+  hidden_dim: 128
+  learning_rate: 0.0001
+  discount: 0.99
+
+optimization:
+  mpc_horizon: 8
+  safety_weight: 10.0
+  conservativeness_alpha: 0.3
+  uncertainty_radius: 0.1
+
+training:
+  max_epochs: 50
+  early_stopping_patience: 10
+  device: auto
+
+evaluation:
+  bootstrap_samples: 5000
+  report_fairness: true
+  report_calibration: true
+  report_dca: true
